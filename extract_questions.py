@@ -17,12 +17,150 @@ Usage:
 
 import fitz  # PyMuPDF
 import os
+import re
 import json
 import argparse
 import sys
 import base64
 import time
 import requests
+
+
+# ---------------------------------------------------------------------------
+# Robust JSON parser for LLM responses
+# ---------------------------------------------------------------------------
+
+def _parse_llm_json(content: str) -> list:
+    """
+    Parse LLM response into a list of question dicts.
+    Handles common LLM quirks:
+    - Markdown code fences: ```json ... ```
+    - Wrapped in {"questions": [...]}
+    - Raw JSON array [...]
+    - Truncated JSON (missing closing brackets)
+    """
+    if not content:
+        return []
+
+    text = content.strip()
+
+    # Strip markdown code fences
+    text = re.sub(r"^```(?:json)?\s*\n?", "", text)
+    text = re.sub(r"\n?```\s*$", "", text)
+    text = text.strip()
+
+    # Try direct parse
+    try:
+        parsed = json.loads(text)
+        if isinstance(parsed, list):
+            return parsed
+        if isinstance(parsed, dict) and "questions" in parsed:
+            return parsed["questions"]
+        if isinstance(parsed, dict):
+            return [parsed] if "question_number" in parsed else []
+        return []
+    except json.JSONDecodeError:
+        pass
+
+    # Try to find a complete JSON array [...] in the text
+    match = re.search(r"\[.*\]", text, re.DOTALL)
+    if match:
+        try:
+            parsed = json.loads(match.group())
+            if isinstance(parsed, list):
+                return parsed
+        except json.JSONDecodeError:
+            pass
+
+    # Try to REPAIR truncated JSON
+    # The LLM may have run out of tokens mid-response
+    repaired = _repair_truncated_json(text)
+    if repaired:
+        return repaired
+
+    # Log raw response for debugging
+    with open("debug_raw_llm.txt", "w", encoding="utf-8") as f:
+        f.write(text)
+    preview = text[:300].encode("ascii", "replace").decode("ascii")
+    print(f"\n  DEBUG raw response saved to debug_raw_llm.txt. Preview: {preview}")
+    return []
+
+
+def _repair_truncated_json(text: str) -> list:
+    """
+    Attempt to repair truncated JSON by:
+    1. Finding the start of the JSON array
+    2. Progressively closing open brackets/braces
+    3. Parsing whatever complete objects we can recover
+    """
+    # Find the start of the array
+    start = text.find("[")
+    if start == -1:
+        return []
+
+    fragment = text[start:]
+
+    # Try closing with increasingly aggressive repairs
+    # Strategy: trim back to the last complete object, then close the array
+    for suffix in ["}", "}]", "\"}}", "\"}]", "\"}}]", "\"}]}",
+                   "\"}", "\"}]"]:
+        candidate = fragment.rstrip(",\n\r\t ") + suffix
+        try:
+            parsed = json.loads(candidate)
+            if isinstance(parsed, list) and len(parsed) > 0:
+                # Verify we got real question objects
+                valid = [q for q in parsed
+                         if isinstance(q, dict) and "question_number" in q]
+                if valid:
+                    print(f"(repaired truncated JSON, recovered {len(valid)} q) ",
+                          end="", flush=True)
+                    return valid
+        except json.JSONDecodeError:
+            continue
+
+    # More aggressive: find all complete question objects by tracking braces
+    objects = []
+    depth = 0
+    obj_start = None
+    in_string = False
+    escape = False
+
+    for i, ch in enumerate(fragment):
+        if escape:
+            escape = False
+            continue
+        if ch == '\\':
+            escape = True
+            continue
+        if ch == '"':
+            in_string = not in_string
+            continue
+            
+        if in_string:
+            continue
+            
+        if ch == '{':
+            if depth == 0:
+                obj_start = i
+            depth += 1
+        elif ch == '}':
+            depth -= 1
+            if depth == 0 and obj_start is not None:
+                obj_str = fragment[obj_start:i + 1]
+                try:
+                    obj = json.loads(obj_str)
+                    if isinstance(obj, dict) and "question_number" in obj:
+                        objects.append(obj)
+                except json.JSONDecodeError:
+                    pass
+                obj_start = None
+
+    if objects:
+        print(f"(extracted {len(objects)} q from partial JSON) ",
+              end="", flush=True)
+        return objects
+
+    return []
 
 
 # ---------------------------------------------------------------------------
@@ -119,7 +257,9 @@ Rules:
     - Combined: $\frac{\sum_{i=1}^{n} x_i}{n}$
   Even simple things like "m/s2" should become $m/s^2$.
 - Ignore page headers, footers, page numbers, watermarks, and any non-question content.
-- If a question has a diagram/figure, note it in the question text as "[See diagram]" but do NOT describe the diagram.
+- If a question has a diagram/figure in the question text, set "has_diagram" to true.
+- If an option's content IS a diagram/graph/figure (not text), set its value to "[diagram]".
+  Example: if option (A) shows a graph image, set "A": "[diagram]".
 - Options may be labeled with letters (A, B, C, D) or numbers (1, 2, 3, 4).
 - Return ONLY valid JSON, no extra text.
 
@@ -127,9 +267,10 @@ Return the data as a JSON array where each element has:
 {
   "question_number": "string (e.g. 'Q.6', '1', 'Q1')",
   "question_text": "string (full question text with LaTeX math)",
+  "has_diagram": true/false,
   "options": {
-    "A": "option text with LaTeX math",
-    "B": "option text with LaTeX math",
+    "A": "option text with LaTeX math OR '[diagram]' if the option is an image",
+    "B": "...",
     ...
   }
 }
@@ -142,91 +283,152 @@ If the page contains no questions, return an empty array: []
 # Provider: OpenRouter (default, works with free models)
 # ---------------------------------------------------------------------------
 
-def extract_with_openrouter(api_key: str, page_png: bytes,
-                            model: str = "google/gemma-4-26b-a4b-it:free") -> list:
+def _call_openrouter(api_key: str, b64_image: str, model: str,
+                     prompt: str, max_tokens: int = 16384) -> tuple:
     """
-    Send a rendered PDF page image to OpenRouter and get back
-    structured question data. Retries on rate limits with fallback models.
+    Make a single OpenRouter API call.
+    Returns (questions_list, was_truncated, raw_content).
     """
-    b64_image = base64.b64encode(page_png).decode("utf-8")
-
-    # Fallback free models if primary is rate-limited
-    FREE_MODELS = [
-        model,
-        "google/gemma-4-31b-it:free",
-        "google/gemma-4-26b-a4b-it:free",
-        "nvidia/nemotron-nano-12b-v2-vl:free",
-        "nex-agi/nex-n2-pro:free",
-    ]
-    # Remove duplicates while preserving order
-    seen = set()
-    models_to_try = []
-    for m in FREE_MODELS:
-        if m not in seen:
-            seen.add(m)
-            models_to_try.append(m)
-
     headers = {
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
     }
 
+    payload = {
+        "model": model,
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": f"data:image/png;base64,{b64_image}",
+                        },
+                    },
+                    {
+                        "type": "text",
+                        "text": prompt,
+                    },
+                ],
+            }
+        ],
+        "temperature": 0.1,
+        "max_tokens": max_tokens,
+        "response_format": {"type": "json_object"},
+    }
+
+    resp = requests.post(
+        "https://openrouter.ai/api/v1/chat/completions",
+        headers=headers,
+        json=payload,
+        timeout=120,
+    )
+
+    if resp.status_code == 429:
+        return None, False, "RATE_LIMITED"
+    if resp.status_code != 200:
+        return None, False, f"ERROR_{resp.status_code}"
+
+    data = resp.json()
+    try:
+        content = data["choices"][0]["message"]["content"]
+        finish_reason = data["choices"][0].get("finish_reason", "")
+
+        # Detect truncation: either the API says so, or the JSON is incomplete
+        content_stripped = content.strip().rstrip()
+        was_truncated = (
+            finish_reason == "length"
+            or (not content_stripped.endswith("]")
+                and not content_stripped.endswith("}"))
+        )
+
+        result = _parse_llm_json(content)
+        return result, was_truncated, content
+    except (TypeError, KeyError, IndexError):
+        return None, False, "PARSE_ERROR"
+
+
+def extract_with_openrouter(api_key: str, page_png: bytes,
+                            model: str = "google/gemini-2.5-flash-lite") -> list:
+    """
+    Send a rendered PDF page image to OpenRouter and get back
+    structured question data. Retries on rate limits with fallback models.
+    If the response is truncated, automatically requests remaining questions.
+    """
+    b64_image = base64.b64encode(page_png).decode("utf-8")
+
+    # Fallback models if primary is rate-limited
+    MODELS = [
+        model,
+        "google/gemini-2.0-flash-001",
+        "google/gemma-4-31b-it:free",
+        "google/gemma-4-26b-a4b-it:free",
+        "nvidia/nemotron-nano-12b-v2-vl:free",
+    ]
+    # Remove duplicates while preserving order
+    seen = set()
+    models_to_try = []
+    for m in MODELS:
+        if m not in seen:
+            seen.add(m)
+            models_to_try.append(m)
+
     for attempt_model in models_to_try:
         for attempt in range(3):
-            payload = {
-                "model": attempt_model,
-                "messages": [
-                    {
-                        "role": "user",
-                        "content": [
-                            {
-                                "type": "image_url",
-                                "image_url": {
-                                    "url": f"data:image/png;base64,{b64_image}",
-                                },
-                            },
-                            {
-                                "type": "text",
-                                "text": EXTRACTION_PROMPT,
-                            },
-                        ],
-                    }
-                ],
-                "temperature": 0.1,
-                "response_format": {"type": "json_object"},
-            }
-
-            resp = requests.post(
-                "https://openrouter.ai/api/v1/chat/completions",
-                headers=headers,
-                json=payload,
-                timeout=120,
+            result, was_truncated, raw = _call_openrouter(
+                api_key, b64_image, attempt_model, EXTRACTION_PROMPT
             )
 
-            if resp.status_code == 200:
-                data = resp.json()
-                try:
-                    content = data["choices"][0]["message"]["content"]
-                    parsed = json.loads(content)
-                    if isinstance(parsed, list):
-                        return parsed
-                    if isinstance(parsed, dict) and "questions" in parsed:
-                        return parsed["questions"]
-                    return []
-                except (json.JSONDecodeError, TypeError, KeyError):
-                    print(f"\n  WARNING: Could not parse response as JSON.")
-                    return []
-
-            elif resp.status_code == 429:
+            if raw == "RATE_LIMITED":
                 wait = 15 * (attempt + 1)
                 print(f"\n  Rate limited ({attempt_model}). "
                       f"Retrying in {wait}s...", end="", flush=True)
                 time.sleep(wait)
-            else:
-                print(f"\n  ERROR [{resp.status_code}]: {resp.text[:200]}")
-                break  # Non-retryable error, try next model
+                continue
 
-        # If all retries exhausted for this model, try next one
+            if raw and raw.startswith("ERROR_"):
+                print(f"\n  {raw} from {attempt_model}")
+                break  # Non-retryable, try next model
+
+            if result:
+                all_questions = list(result)
+
+                # If truncated, ask for remaining questions
+                if was_truncated and all_questions:
+                    got_nums = [q.get("question_number", "") for q in all_questions]
+                    print(f"(got {len(all_questions)}, truncated, fetching rest) ",
+                          end="", flush=True)
+                    time.sleep(2)
+
+                    cont_prompt = (
+                        f"I already extracted these questions from this page: "
+                        f"{', '.join(got_nums)}.\n"
+                        f"Extract ONLY the REMAINING questions that I have NOT "
+                        f"yet extracted. Use the same JSON format and LaTeX rules.\n"
+                        f"If an option is a diagram/image, set its value to \"[diagram]\".\n"
+                        f"Return a JSON array of the remaining questions only.\n"
+                        f"If there are no remaining questions, return: []"
+                    )
+
+                    more, _, _ = _call_openrouter(
+                        api_key, b64_image, attempt_model, cont_prompt
+                    )
+                    if more:
+                        # Deduplicate by question number
+                        existing_nums = set(got_nums)
+                        for q in more:
+                            qn = q.get("question_number", "")
+                            if qn not in existing_nums:
+                                all_questions.append(q)
+                                existing_nums.add(qn)
+                        print(f"+{len(more)} more ", end="", flush=True)
+
+                return all_questions
+
+            # result is None or empty — try next attempt
+
+        # All retries exhausted for this model, try next one
 
     print(f"\n  All models exhausted. Could not extract questions.")
     return []
@@ -280,14 +482,9 @@ def extract_with_gemini(api_key: str, page_png: bytes,
     data = resp.json()
     try:
         content = data["candidates"][0]["content"]["parts"][0]["text"]
-        parsed = json.loads(content)
-        if isinstance(parsed, list):
-            return parsed
-        if isinstance(parsed, dict) and "questions" in parsed:
-            return parsed["questions"]
-        return []
-    except (json.JSONDecodeError, TypeError, KeyError, IndexError):
-        print(f"\n  WARNING: Could not parse Gemini response as JSON.")
+        return _parse_llm_json(content)
+    except (TypeError, KeyError, IndexError):
+        print(f"\n  WARNING: Could not parse Gemini response.")
         return []
 
 
@@ -297,24 +494,62 @@ def extract_with_gemini(api_key: str, page_png: bytes,
 
 def merge_questions_with_images(questions: list, images: list) -> list:
     """
-    Attach extracted diagram paths to questions.
-    Each image is attached to the question that appears just before it
-    in page order (by question index).
+    Attach extracted diagram paths to questions and option-level diagrams.
+    Uses Y-coordinate matching to assign images to the correct question
+    or option.
+    
+    Output fields:
+      - "diagram": path for the question-level diagram (or null)
+      - "option_diagrams": dict of {"A": path, ...} for image-based options (or {})
     """
-    if not images or not questions:
-        for q in questions:
-            if "diagram" not in q:
-                q["diagram"] = None
-        return questions
-
-    num_q = len(questions)
-    for i, img in enumerate(images):
-        if i < num_q:
-            questions[i]["diagram"] = img["relative_path"]
-
+    # Ensure all questions have the required fields
     for q in questions:
         if "diagram" not in q:
             q["diagram"] = None
+        if "option_diagrams" not in q:
+            q["option_diagrams"] = {}
+        # Clean up the LLM's has_diagram field (we handle it via PyMuPDF)
+        q.pop("has_diagram", None)
+
+    if not images or not questions:
+        return questions
+
+    # Build a list of "slots" that need images, in page order
+    # Each slot is either a question-level diagram or an option-level diagram
+    slots = []
+    for qi, q in enumerate(questions):
+        # Check if question itself needs a diagram
+        qtext = q.get("question_text", "")
+        if "[See diagram]" in qtext or "[diagram]" in qtext.lower():
+            slots.append({"type": "question", "qi": qi})
+
+        # Check which options need diagrams
+        for key, val in q.get("options", {}).items():
+            if isinstance(val, str) and "[diagram]" in val.lower():
+                slots.append({"type": "option", "qi": qi, "key": key})
+
+    if not slots:
+        # No slots identified by LLM - fall back to simple assignment:
+        # first image -> first question's diagram, etc.
+        for i, img in enumerate(images):
+            if i < len(questions):
+                questions[i]["diagram"] = img["relative_path"]
+        return questions
+
+    # Assign images to slots in order (both are sorted top-to-bottom)
+    # Images are already sorted by Y from extract_images_from_page
+    img_idx = 0
+    for slot in slots:
+        if img_idx >= len(images):
+            break
+        if slot["type"] == "question":
+            questions[slot["qi"]]["diagram"] = images[img_idx]["relative_path"]
+            img_idx += 1
+        elif slot["type"] == "option":
+            qi = slot["qi"]
+            key = slot["key"]
+            questions[qi]["option_diagrams"][key] = images[img_idx]["relative_path"]
+            img_idx += 1
 
     return questions
 
@@ -398,6 +633,12 @@ def extract_from_pdf(pdf_path: str, api_key: str,
         page_png = render_page_to_png(page)
         questions = extract_fn(page_png)
 
+        # Retry once if page returned 0 questions (likely rate-limited)
+        if not questions:
+            print("0 found, retrying in 30s...", end=" ", flush=True)
+            time.sleep(30)
+            questions = extract_fn(page_png)
+
         # Step 3: Merge images into questions
         questions = merge_questions_with_images(questions, images)
 
@@ -405,9 +646,9 @@ def extract_from_pdf(pdf_path: str, api_key: str,
               f"{len(images)} diagram(s)")
         all_questions.extend(questions)
 
-        # Small delay to respect rate limits
+        # Delay between pages to respect rate limits
         if page_idx != page_indices[-1]:
-            time.sleep(1)
+            time.sleep(5)
 
     # Write JSON
     with open(output_json, "w", encoding="utf-8") as f:
